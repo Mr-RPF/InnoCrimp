@@ -3,6 +3,8 @@ import warnings
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Polygon, Circle
+from ipywidgets import interact, FloatSlider
+
 
 
 def _rot(v, ang):
@@ -32,19 +34,26 @@ class Crimper:
 
     Treat the parameters as fixed; to change one, make a new object with .with_(...)
     """
-    def __init__(self, N, Rp, bd, sd, bp, sp, width_factor=0.16):
-        self.N, self.Rp = N, Rp
-        self.bd, self.sd, self.bp, self.sp = bd, sd, bp, sp
-        self.width_factor = width_factor
+
+    def __init__(self, N, Rp, bd, sd, bp, sp, pin_diameter, head_width):
+        self.N  = N
+        self.Rp = Rp
+        self.bd = bd
+        self.sd = sd
+        self.bp = bp
+        self.sp = sp 
+        self.W = head_width
         if not (-self.W <= sd <= 0 and -self.W <= sp <= 0):
             warnings.warn("a pin offset is outside the blade body: for a flat + angled blade "
                           "sd and sp should satisfy -W <= s <= 0")
         if self.L >= Rp:
             warnings.warn("pivot-to-drive-pin distance L must be smaller than Rp")
 
+        self.pin_diameter = pin_diameter
+
+
     # ----- derived geometry -----
-    @property
-    def W(self):  return self.width_factor * self.Rp
+
     @property
     def bl(self): return self.W / np.tan(2*np.pi/self.N)
     @property
@@ -59,7 +68,7 @@ class Crimper:
     @property
     def params(self):
         return dict(N=self.N, Rp=self.Rp, bd=self.bd, sd=self.sd, bp=self.bp, sp=self.sp,
-                    width_factor=self.width_factor)
+                    width=self.W)
 
     def with_(self, **changes):
         """New crimper with some parameters changed, e.g. c.with_(bd=13)."""
@@ -115,7 +124,7 @@ class Crimper:
         return 2*rho*np.sin(np.pi/self.N)*np.cos(omega + np.pi/self.N)
 
     # ----- drive angle limits -----
-    def limits(self, tol=0.05, margin_deg=2.0, step_deg=0.05):
+    def limits(self, tol=0, margin_deg=2.0, step_deg=0.01):
         kin = np.degrees(np.arcsin(self.L/self.Rp))
         top = kin - margin_deg
         ds = np.arange(0.0, top + step_deg, step_deg)
@@ -138,7 +147,7 @@ class Crimper:
         T, u = p["T"], p["u"]
         return 2*abs(T[0]*u[1] - T[1]*u[0])
 
-    def plot(self, delta_deg, ax=None, pin_d=3.0, tol=0.05, show_slots=True, show_circles=True,
+    def plot(self, delta_deg, ax=None, tol=0.001, show_slots=True, show_circles=True,
              show_pins=True, labels=False, view=None):
         """
         Draw the crimper at ring angle delta_deg.
@@ -161,15 +170,15 @@ class Crimper:
             if show_slots:                                  # radial hub slot for blade i
                 ang = 2*np.pi*i/self.N + np.radians(delta_deg)
                 e, nrm = np.array([np.cos(ang), np.sin(ang)]), np.array([-np.sin(ang), np.cos(ang)])
-                h = pin_d/2
+                h = self.pin_diameter
                 ax.add_patch(Polygon([r_lo*e - h*nrm, r_hi*e - h*nrm, r_hi*e + h*nrm, r_lo*e + h*nrm],
                                      closed=True, facecolor="#EF9F27", alpha=0.35, edgecolor="none", zorder=2))
             face = "#F4A6A6" if hit else ("#9FC5E8" if i == 0 else "#D9E6F2")
             ax.add_patch(Polygon(self.polygon(pose), closed=True, facecolor=face,
                                  edgecolor="#2B4C6F", lw=1.2 if i == 0 else 0.8))
             if show_pins:
-                ax.add_patch(Circle(pose["P"], pin_d/2, color="#7F77DD", zorder=3))
-                ax.add_patch(Circle(pose["Q"], pin_d/2, color="#EF9F27", zorder=3))
+                ax.add_patch(Circle(pose["P"], self.pin_diameter/2, color="#7F77DD", zorder=3))
+                ax.add_patch(Circle(pose["Q"], self.pin_diameter/2, color="#EF9F27", zorder=3))
         p0 = self.blade_pose(delta_deg, 0)
         D, Dins = self.aperture(delta_deg), self.inscribed_aperture(delta_deg)
         if show_circles:
@@ -194,7 +203,6 @@ class Crimper:
 
     def plot_sequence(self, angles=None, ncols=3, **kwargs):
         """Several ring angles side by side. Default: closed, 1/3, 2/3 and the collision-free maximum."""
-        import matplotlib.pyplot as plt
         if angles is None:
             top = self.limits()["collision_free_max"]
             angles = [0.0, top/3, 2*top/3, top]
@@ -210,9 +218,23 @@ class Crimper:
 
     def interactive(self, **kwargs):
         """Slider for the ring angle (needs ipywidgets in Jupyter)."""
-        from ipywidgets import interact, FloatSlider
-        top = self.limits()["usable_max"]
+        top = self.limits()["collision_free_max"]
         def draw(delta):
             self.plot(delta, **kwargs)
         return interact(draw, delta=FloatSlider(min=0.0, max=top, step=0.5, value=min(20.0, top),
                                                 description="ring angle"))
+
+    def plot_gap_over_angle(self):
+
+        plt.xlabel("Drive angle [deg]")
+        plt.ylabel("Gap [mm]")
+        plt.title("Gap over Angle")
+        max_no_colision = self.limits()["collision_free_max"]
+
+        angle_list = np.linspace(0.0, max_no_colision, num=1000)
+        gap_at_angle =[]
+        for angle in angle_list:
+            gap_at_angle.append(self.gap(angle))
+
+        plt.plot(angle_list,gap_at_angle)
+        plt.show()
