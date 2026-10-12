@@ -43,9 +43,15 @@ class Crimper:
         self.bp = bp
         self.sp = sp 
         self.W = head_width
-        if not (-self.W <= sd <= 0 and -self.W <= sp <= 0):
-            warnings.warn("a pin offset is outside the blade body: for a flat + angled blade "
+        if not (-self.W     <= sd-(pin_diameter/2) and
+                0           >= sd+(pin_diameter/2) and
+                -self.W    <= sp-(pin_diameter/2) and
+                0           >= sp-(pin_diameter/2)):
+            warnings.warn("a pin is is outside the blade body: for a flat + angled blade "
                           "sd and sp should satisfy -W <= s <= 0")
+    
+            raise ValueError("pin outside the crimp head body choose an appropiate postion for the pins")
+        
         if self.L >= Rp:
             warnings.warn("pivot-to-drive-pin distance L must be smaller than Rp")
 
@@ -98,13 +104,16 @@ class Crimper:
         return dict(O=np.zeros(2), P=_rot(P, al), Q=_rot(Q, al), T=_rot(T, al),
                     u=_rot(u, al), n=_rot(n, al), phi=phi + al, r=r)
 
-    def mechanism(self, drive_ring_angle, blade_number=0):      # same outputs as your function
+    def mechanism(self, drive_ring_angle, blade_number=0):
         p = self.blade_pose(drive_ring_angle, blade_number)
         return p["O"], p["Q"], p["P"], p["T"]
 
     def aperture(self, delta_deg):
         """Tip-circle diameter (mm)."""
         return 2*np.linalg.norm(self.blade_pose(delta_deg)["T"])
+
+    def rate_of_aperture(self, delta_deg):
+        return
 
     # ----- blade outline and gap -----
     def polygon(self, pose):
@@ -124,7 +133,7 @@ class Crimper:
         return 2*rho*np.sin(np.pi/self.N)*np.cos(omega + np.pi/self.N)
 
     # ----- drive angle limits -----
-    def limits(self, tol=0, margin_deg=2.0, step_deg=0.01):
+    def limits(self, tol=1e-6, margin_deg=2.0, step_deg=0.01):
         kin = np.degrees(np.arcsin(self.L/self.Rp))
         top = kin - margin_deg
         ds = np.arange(0.0, top + step_deg, step_deg)
@@ -147,7 +156,7 @@ class Crimper:
         T, u = p["T"], p["u"]
         return 2*abs(T[0]*u[1] - T[1]*u[0])
 
-    def plot(self, delta_deg, ax=None, tol=0.001, show_slots=True, show_circles=True,
+    def plot(self, delta_deg, ax=None, tol=1e-6, show_slots=True, show_circles=True,
              show_pins=True, labels=False, view=None):
         """
         Draw the crimper at ring angle delta_deg.
