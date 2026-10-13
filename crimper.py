@@ -114,28 +114,37 @@ class Crimper:
 
     def rate_of_aperture(self, delta_deg, blade_number =0):
 
-        d = np.deg2rad(delta_deg)
-        S = self.L**2 - (self.Rp*np.sin(d))**2
-        if S < 0:
-            raise ValueError("ring angle beyond the kinematic limit asin(L/Rp)")
-        r = self.Rp*np.cos(d) - np.sqrt(S)
+        pose = self.blade_pose(delta_deg,blade_number)
 
-        P = np.array([self.Rp, 0.0])
-        Q = r*np.array([np.cos(d), np.sin(d)])
+        d   = np.deg2rad(delta_deg)
+        S   = self.L**2 - (self.Rp*np.sin(d))**2
+
+        r   = pose["r"]
+        P   = pose["P"]
+        Q   = pose["Q"]
+        phi = pose["phi"]
+        T   = pose["T"]
+        
+
         w = Q - P
-        phi = np.arctan2(w[1], w[0]) - np.arctan2(self.c, self.a)
+        A = T - Q
+        
 
         r_per_delta = (self.Rp * r * np.sin(d))/np.sqrt(S)
 
         Q_per_delta = r_per_delta * np.array([np.cos(d), np.sin(d)]) + r * np.array([-np.sin(d), np.cos(d)])
 
-        phi_per_delta = (Q_per_delta[1]*w[0] - Q_per_delta[0]*w[1])/ self.L**2
+        phi_per_delta = (w[0]*Q_per_delta[1] - w[1]*Q_per_delta[0])/ self.L**2
 
         u_per_delta = np.array([-np.sin(phi),np.cos(phi)])*phi_per_delta
 
         n_per_delta = np.array([np.cos(phi),np.sin(phi)])*(-1)*phi_per_delta
 
-        rate_of_aperture = 2*(Q_per_delta + (self.bd*u_per_delta) - (self.sd*n_per_delta ))
+        T_per_delta = Q_per_delta + phi_per_delta * np.array(-A[1],A[0])
+
+        rho_per_delta = (T @ T_per_delta)/np.linalg.norm(T) * np.pi/180
+
+        diameter_per_delta = 2 * rho_per_delta
 
         rate = dict(
             delta_r=r_per_delta,
@@ -143,19 +152,24 @@ class Crimper:
             delta_phi = phi_per_delta,
             delta_u = u_per_delta,
             delta_n = n_per_delta,
-            rate_of_aperture = rate_of_aperture
+            diameter_per_delta = diameter_per_delta
             )
+        
         return rate
 
+
+    
     # ----- blade outline and gap -----
     def polygon(self, pose):
         local = np.array([[0, 0], [self.bl, -self.W], [self.Lb, -self.W], [self.Lb, 0]])
         return np.array([pose["T"] - b*pose["u"] + s*pose["n"] for b, s in local])
 
+
     def gap(self, delta_deg):
         """Clearance between neighbouring blades (mm; negative = overlap)."""
         return sat_clearance(self.polygon(self.blade_pose(delta_deg, 0)),
                              self.polygon(self.blade_pose(delta_deg, 1)))
+
 
     def gap_formula(self, delta_deg):
         """Same gap from d = 2*rho*sin(pi/N)*cos(omega + pi/N)."""
@@ -187,6 +201,7 @@ class Crimper:
         p = self.blade_pose(delta_deg)
         T, u = p["T"], p["u"]
         return 2*abs(T[0]*u[1] - T[1]*u[0])
+
 
     def plot(self, delta_deg, ax=None, tol=1e-6, show_slots=True, show_circles=True,
              show_pins=True, labels=False, view=None):
@@ -242,6 +257,7 @@ class Crimper:
             plt.show()
         return ax
 
+
     def plot_sequence(self, angles=None, ncols=3, **kwargs):
         """Several ring angles side by side. Default: closed, 1/3, 2/3 and the collision-free maximum."""
         if angles is None:
@@ -257,6 +273,7 @@ class Crimper:
         plt.show()
         return fig
 
+
     def interactive(self, **kwargs):
         """Slider for the ring angle (needs ipywidgets in Jupyter)."""
         top = self.limits()["collision_free_max"]
@@ -264,6 +281,7 @@ class Crimper:
             self.plot(delta, **kwargs)
         return interact(draw, delta=FloatSlider(min=0.0, max=top, step=0.5, value=min(20.0, top),
                                                 description="ring angle"))
+
 
     def plot_gap_over_angle(self):
 
@@ -278,4 +296,46 @@ class Crimper:
             gap_at_angle.append(self.gap(angle))
 
         plt.plot(angle_list,gap_at_angle)
+        plt.show()
+
+
+    def plot_rate_of_aperture(self):
+        plt.xlabel("Drive angle [deg]")
+        plt.ylabel("diameter/angle [mm/]")
+        plt.title("change rate of diameter per angle")
+
+        max_no_colision = self.limits()["collision_free_max"]
+
+        angle_list = np.linspace(0.0, max_no_colision, num=1000)
+
+        diameter =[]
+        for angle in angle_list:
+            diameter.append(self.aperture(angle))
+
+        dydx = np.gradient(diameter, angle_list)
+        
+
+        delta_d =[]
+        for angle in angle_list:
+            delta_d.append(self.rate_of_aperture(angle)["diameter_per_delta"])
+
+        print(delta_d)
+        plt.plot(angle_list, dydx)
+        #plt.plot(angle_list, delta_d)
+        plt.show()
+
+
+    def plot_apperture_by_angle(self):
+        plt.xlabel("Drive angle [deg]")
+        plt.ylabel("Diameter [mm]")
+        plt.title("Diameter over actuation angle")
+
+        max_no_colision = self.limits()["collision_free_max"]
+
+        angle_list = np.linspace(0.0, max_no_colision, num=1000)
+        diameter =[]
+        for angle in angle_list:
+            diameter.append(self.aperture(angle))
+
+        plt.plot(angle_list,diameter)
         plt.show()
