@@ -112,8 +112,40 @@ class Crimper:
         """Tip-circle diameter (mm)."""
         return 2*np.linalg.norm(self.blade_pose(delta_deg)["T"])
 
-    def rate_of_aperture(self, delta_deg):
-        return
+    def rate_of_aperture(self, delta_deg, blade_number =0):
+
+        d = np.deg2rad(delta_deg)
+        S = self.L**2 - (self.Rp*np.sin(d))**2
+        if S < 0:
+            raise ValueError("ring angle beyond the kinematic limit asin(L/Rp)")
+        r = self.Rp*np.cos(d) - np.sqrt(S)
+
+        P = np.array([self.Rp, 0.0])
+        Q = r*np.array([np.cos(d), np.sin(d)])
+        w = Q - P
+        phi = np.arctan2(w[1], w[0]) - np.arctan2(self.c, self.a)
+
+        r_per_delta = (self.Rp * r * np.sin(d))/np.sqrt(S)
+
+        Q_per_delta = r_per_delta * np.array([np.cos(d), np.sin(d)]) + r * np.array([-np.sin(d), np.cos(d)])
+
+        phi_per_delta = (Q_per_delta[1]*w[0] - Q_per_delta[0]*w[1])/ self.L**2
+
+        u_per_delta = np.array([-np.sin(phi),np.cos(phi)])*phi_per_delta
+
+        n_per_delta = np.array([np.cos(phi),np.sin(phi)])*(-1)*phi_per_delta
+
+        rate_of_aperture = 2*(Q_per_delta + (self.bd*u_per_delta) - (self.sd*n_per_delta ))
+
+        rate = dict(
+            delta_r=r_per_delta,
+            delta_Q= Q_per_delta,
+            delta_phi = phi_per_delta,
+            delta_u = u_per_delta,
+            delta_n = n_per_delta,
+            rate_of_aperture = rate_of_aperture
+            )
+        return rate
 
     # ----- blade outline and gap -----
     def polygon(self, pose):
