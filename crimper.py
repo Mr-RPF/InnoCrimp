@@ -35,7 +35,7 @@ class Crimper:
     Treat the parameters as fixed; to change one, make a new object with .with_(...)
     """
 
-    def __init__(self, N, Rp, bd, sd, bp, sp, pin_diameter, head_width):
+    def __init__(self, N, Rp, bd, sd, bp, sp, pin_diameter, head_width,depth):
         self.N  = N
         self.Rp = Rp
         self.bd = bd
@@ -43,6 +43,7 @@ class Crimper:
         self.bp = bp
         self.sp = sp 
         self.W = head_width
+        self.depth = depth
         if not (-self.W     <= sd-(pin_diameter/2) and
                 0           >= sd+(pin_diameter/2) and
                 -self.W    <= sp-(pin_diameter/2) and
@@ -76,9 +77,11 @@ class Crimper:
         return dict(N=self.N, Rp=self.Rp, bd=self.bd, sd=self.sd, bp=self.bp, sp=self.sp,
                     width=self.W)
 
+
     def with_(self, **changes):
         """New crimper with some parameters changed, e.g. c.with_(bd=13)."""
         return Crimper(**{**self.params, **changes})
+
 
     def __repr__(self):
         p = ", ".join(f"{k}={v}" for k, v in self.params.items())
@@ -104,13 +107,16 @@ class Crimper:
         return dict(O=np.zeros(2), P=_rot(P, al), Q=_rot(Q, al), T=_rot(T, al),
                     u=_rot(u, al), n=_rot(n, al), phi=phi + al, r=r)
 
+
     def mechanism(self, drive_ring_angle, blade_number=0):
         p = self.blade_pose(drive_ring_angle, blade_number)
         return p["O"], p["Q"], p["P"], p["T"]
 
+
     def aperture(self, delta_deg):
         """Tip-circle diameter (mm)."""
         return 2*np.linalg.norm(self.blade_pose(delta_deg)["T"])
+
 
     def rate_of_aperture(self, delta_deg, blade_number =0):
 
@@ -132,7 +138,11 @@ class Crimper:
 
         r_per_delta = (self.Rp * r * np.sin(d))/np.sqrt(S)
 
-        Q_per_delta = r_per_delta * np.array([np.cos(d), np.sin(d)]) + r * np.array([-np.sin(d), np.cos(d)])
+        al = 2*np.pi*blade_number/self.N
+        e  = np.array([np.cos(d + al), np.sin(d + al)])
+        ep = np.array([-np.sin(d + al), np.cos(d + al)])
+
+        Q_per_delta = r_per_delta * e + r * ep
 
         phi_per_delta = (w[0]*Q_per_delta[1] - w[1]*Q_per_delta[0])/ self.L**2
 
@@ -140,11 +150,13 @@ class Crimper:
 
         n_per_delta = np.array([np.cos(phi),np.sin(phi)])*(-1)*phi_per_delta
 
-        T_per_delta = Q_per_delta + phi_per_delta * np.array(-A[1],A[0])
+        T_per_delta = Q_per_delta + phi_per_delta * np.array([-A[1],A[0]])
 
-        rho_per_delta = (T @ T_per_delta)/np.linalg.norm(T) * np.pi/180
+        rho_per_delta = (T @ T_per_delta)/np.linalg.norm(T)      # mm per radian, same unit as the others
 
-        diameter_per_delta = 2 * rho_per_delta
+        diameter_per_delta = 2*rho_per_delta                      # mm per radian
+
+        diameter_per_deg = diameter_per_delta*np.pi/180           # separate key, mm per degree, for reading only
 
         rate = dict(
             delta_r=r_per_delta,
@@ -152,14 +164,94 @@ class Crimper:
             delta_phi = phi_per_delta,
             delta_u = u_per_delta,
             delta_n = n_per_delta,
-            diameter_per_delta = diameter_per_delta
+            drho = rho_per_delta,
+            diameter_per_delta = diameter_per_delta,
+            diameter_per_deg = diameter_per_deg
             )
         
         return rate
 
 
+    #------  Torque and Forces ---------
+
+    def ring_torque_curve(self, F, efficiency=0.6, per_blade=True, n_points=300):
+        """
+        tau_ring = F_total * |d rho / d delta| / efficiency      (virtual work)
+        F         : radial force of one tip in N (number), or a function F(D_mm) -> N
+        per_blade : True: F is for ONE blade (multiplied by N); False: F is the total force
+        returns angles (deg), apertures (mm), torque (N*m)
+        """
+        lim = self.limits()
+        angles = np.linspace(lim["collision_free_min"], lim["collision_free_max"], n_points)
+        D = np.array([self.aperture(a) for a in angles])
+        drho = np.array([abs(self.rate_of_aperture(a)["drho"]) for a in angles])   # mm per rad
+        F_each = np.array([F(x) for x in D], dtype=float) if callable(F) else np.full(D.shape, float(F))
+        F_tot = F_each*self.N if per_blade else F_each
+        return angles, D, F_tot*drho/1000.0/efficiency          # N*mm -> N*m
+
+
+    def ring_torque(self, F, efficiency=0.6, per_blade=True, n_points=300):
+        """Worst-case ring torque over the collision-free range and where it occurs."""
+        angles, D, tau = self.ring_torque_curve(F, efficiency, per_blade, n_points)
+        i = int(np.argmax(tau))
+        return dict(torque_Nm=tau[i], at_angle_deg=angles[i], at_aperture_mm=D[i])
+
+
+    def motor_torque(self, F, gear_ratio, efficiency=0.6, gear_efficiency=0.9, **kw):
+        """Motor torque for a reduction of gear_ratio (motor turns per ring turn)."""
+        return self.ring_torque(F, efficiency, **kw)["torque_Nm"]/(gear_ratio*gear_efficiency)
+
+
+    def pin_forces(self, delta_deg, F):
+        """
+        Forces on blade 0 for a stent force F (N) on ONE blade, acting on the flat face.
+        Frictionless radial slot. Returns F_slot (on the drive pin), R_pivot (on the pivot pin).
+        Components are in the world frame, in N.
+        """
+        cross = lambda p, q: p[0]*q[1] - p[1]*q[0]
+        d = np.deg2rad(delta_deg)
+        pose = self.blade_pose(delta_deg, 0)
+        P, Q, T, u, n = pose["P"], pose["Q"], pose["T"], pose["u"], pose["n"]
+
+        H  = T - (T @ u)*u                       # contact point on the flat face
+        m  = np.sign(T @ n)*n                    # normal pointing away from O
+        Fs = F*m                                 # stent force on the blade
+        ep = np.array([-np.sin(d), np.cos(d)])   # direction of the slot force (perpendicular to the slot)
+
+        Ft      = -cross(H - P, Fs)/cross(Q - P, ep)   # moment balance about P
+        F_slot  = Ft*ep
+        R_pivot = -(Fs + F_slot)                       # force balance
+        return dict(F_t=Ft, F_slot=F_slot, R_pivot=R_pivot,
+                    slot_N=abs(Ft), pivot_N=float(np.linalg.norm(R_pivot)),
+                    r=pose["r"], contact_point=H,
+                    ring_torque_per_blade_Nm=abs(Ft)*pose["r"]/1000.0)
+
+
+    def max_pin_forces(self, F, n_points=300, per_blade=True):
+        """
+        Largest pin loads over the collision-free ring range (Model A, frictionless slot).
+        F         : stent force on ONE blade in N (number), or a function F(D_mm) -> N
+        per_blade : False if F is the TOTAL stent force over all blades (it is divided by N)
+        Returns the maxima, where they occur, and the full curves for plotting.
+        """
+
+        lim = self.limits()
+        angles = np.linspace(lim["collision_free_min"], lim["collision_free_max"], n_points)
+        D = np.array([self.aperture(a) for a in angles])
+        F_each = np.array([F(x) for x in D], dtype=float) if callable(F) else np.full(D.shape, float(F))
+        if not per_blade:
+            F_each = F_each/self.N
+        rows = [self.pin_forces(a, f) for a, f in zip(angles, F_each)]
+        slot = np.array([r["slot_N"] for r in rows])
+        piv  = np.array([r["pivot_N"] for r in rows])
+        i, j = int(np.argmax(slot)), int(np.argmax(piv))
+        return dict(max_slot_N=slot[i], slot_at_angle_deg=angles[i], slot_at_aperture_mm=D[i],
+                    max_pivot_N=piv[j], pivot_at_angle_deg=angles[j], pivot_at_aperture_mm=D[j],
+                    max_pivot_vector_N=rows[j]["R_pivot"],
+                    angles=angles, aperture=D, slot_N=slot, pivot_N=piv, F_each=F_each)
     
     # ----- blade outline and gap -----
+    
     def polygon(self, pose):
         local = np.array([[0, 0], [self.bl, -self.W], [self.Lb, -self.W], [self.Lb, 0]])
         return np.array([pose["T"] - b*pose["u"] + s*pose["n"] for b, s in local])
@@ -179,6 +271,7 @@ class Crimper:
         return 2*rho*np.sin(np.pi/self.N)*np.cos(omega + np.pi/self.N)
 
     # ----- drive angle limits -----
+
     def limits(self, tol=1e-6, margin_deg=2.0, step_deg=0.01):
         kin = np.degrees(np.arcsin(self.L/self.Rp))
         top = kin - margin_deg
@@ -276,10 +369,12 @@ class Crimper:
 
     def interactive(self, **kwargs):
         """Slider for the ring angle (needs ipywidgets in Jupyter)."""
-        top = self.limits()["collision_free_max"]
+        lim = self.limits()
+        top = lim["collision_free_max"]
+        bot = lim["collision_free_min"]
         def draw(delta):
             self.plot(delta, **kwargs)
-        return interact(draw, delta=FloatSlider(min=0.0, max=top, step=0.5, value=min(20.0, top),
+        return interact(draw, delta=FloatSlider(min=bot, max=top, step=0.5, value=min(20.0, top),
                                                 description="ring angle"))
 
 
@@ -288,9 +383,13 @@ class Crimper:
         plt.xlabel("Drive angle [deg]")
         plt.ylabel("Gap [mm]")
         plt.title("Gap over Angle")
-        max_no_colision = self.limits()["collision_free_max"]
 
-        angle_list = np.linspace(0.0, max_no_colision, num=1000)
+
+        lim = self.limits()
+        top = lim["collision_free_max"]
+        bot = lim["collision_free_min"]
+        angle_list = np.linspace(bot, top, num=1000)
+
         gap_at_angle =[]
         for angle in angle_list:
             gap_at_angle.append(self.gap(angle))
@@ -304,35 +403,31 @@ class Crimper:
         plt.ylabel("diameter/angle [mm/]")
         plt.title("change rate of diameter per angle")
 
-        max_no_colision = self.limits()["collision_free_max"]
-
-        angle_list = np.linspace(0.0, max_no_colision, num=1000)
-
-        diameter =[]
-        for angle in angle_list:
-            diameter.append(self.aperture(angle))
-
-        dydx = np.gradient(diameter, angle_list)
-        
+        lim = self.limits()
+        top = lim["collision_free_max"]
+        bot = lim["collision_free_min"]
+        angle_list = np.linspace(bot, top, num=1000)
 
         delta_d =[]
         for angle in angle_list:
             delta_d.append(self.rate_of_aperture(angle)["diameter_per_delta"])
 
         print(delta_d)
-        plt.plot(angle_list, dydx)
-        #plt.plot(angle_list, delta_d)
+        #plt.plot(angle_list, dydx)
+        plt.plot(angle_list, delta_d)
         plt.show()
 
 
-    def plot_apperture_by_angle(self):
+    def plot_diameter_by_angle(self):
         plt.xlabel("Drive angle [deg]")
         plt.ylabel("Diameter [mm]")
         plt.title("Diameter over actuation angle")
 
-        max_no_colision = self.limits()["collision_free_max"]
-
-        angle_list = np.linspace(0.0, max_no_colision, num=1000)
+        lim = self.limits()
+        top = lim["collision_free_max"]
+        bot = lim["collision_free_min"]
+        angle_list = np.linspace(bot, top, num=1000)
+        
         diameter =[]
         for angle in angle_list:
             diameter.append(self.aperture(angle))
