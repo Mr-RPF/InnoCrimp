@@ -36,6 +36,7 @@ class Crimper:
     """
 
     def __init__(self, N, Rp, bd, sd, bp, sp, pin_diameter, head_width,depth):
+
         self.N  = N
         self.Rp = Rp
         self.bd = bd
@@ -44,19 +45,16 @@ class Crimper:
         self.sp = sp 
         self.W = head_width
         self.depth = depth
-        if not (-self.W     <= sd-(pin_diameter/2) and
-                0           >= sd+(pin_diameter/2) and
-                -self.W    <= sp-(pin_diameter/2) and
-                0           >= sp-(pin_diameter/2)):
-            warnings.warn("a pin is is outside the blade body: for a flat + angled blade "
-                          "sd and sp should satisfy -W <= s <= 0")
-    
-            raise ValueError("pin outside the crimp head body choose an appropiate postion for the pins")
-        
-        if self.L >= Rp:
-            warnings.warn("pivot-to-drive-pin distance L must be smaller than Rp")
-
         self.pin_diameter = pin_diameter
+        for name, m in self.pin_margins().items():
+            worst = min(m.values())
+            if worst < 0:
+                raise ValueError(f"{name} pin (d={pin_diameter}) sticks out of the head by {-worst:.3f} mm "
+                                 f"(margins to the edges: { {k: round(v, 3) for k, v in m.items()} })")
+        if self.L >= Rp:
+            raise ValueError("pivot-to-drive-pin distance L must be smaller than Rp")
+        
+        
 
 
     # ----- derived geometry -----
@@ -249,9 +247,80 @@ class Crimper:
                     max_pivot_N=piv[j], pivot_at_angle_deg=angles[j], pivot_at_aperture_mm=D[j],
                     max_pivot_vector_N=rows[j]["R_pivot"],
                     angles=angles, aperture=D, slot_N=slot, pivot_N=piv, F_each=F_each)
+
+    #------ Construction and design ------
+
+    def head_outline(self):
+        """Head outline in blade coordinates (b along the blade from the tip, s across it)."""
+        return np.array([[0, 0], [self.bl, -self.W], [self.Lb, -self.W], [self.Lb, 0]], float)
+
+    def _edge_distances(self, which):
+        """Signed distance (mm) from the pin centre to each edge line; positive = inside the head.
+        The outline is convex, so the smallest value is the true distance to the boundary."""
+        p = np.array((self.bd, self.sd) if which == "drive" else (self.bp, self.sp), float)
+        pts = self.head_outline()
+        names = ["angled_face", "far_edge", "back_end", "flat_face"]
+        out = {}
+        for i, nm in enumerate(names):
+            a, b = pts[i], pts[(i + 1) % 4]
+            ab = b - a
+            out[nm] = float((ab[0]*(p[1]-a[1]) - ab[1]*(p[0]-a[0])) / np.hypot(*ab))
+        return out
+
+    def pin_margins(self):
+        """Material left between each pin and every head edge (mm). Negative = sticks out."""
+        r = self.pin_diameter/2
+        return {w: {k: v - r for k, v in self._edge_distances(w).items()} for w in ("drive", "pivot")}
+
+    def max_pin_for_width(self, which="drive", edge_margin_mm=1.0):
+        """Largest pin diameter that fits in the head, keeping edge_margin_mm to the nearest edge."""
+        return 2*(min(self._edge_distances(which).values()) - edge_margin_mm)
+
+    def min_pin_diameter(self, force_N, sy_MPa, safety_factor=2.0, shear_planes=2,
+                         bearing_length_mm=None, span_mm=None,
+                         support="simple", arm_mm=None, bearing_allow_MPa=None):
+        """
+        Minimum diameter (mm) for ONE pin carrying force_N. Uses only pin geometry, not self.depth.
+
+        bearing_length_mm : length of pin inside the part that loads it (bearing check, and the length
+                            over which the load is spread). None -> bearing check skipped.
+        span_mm           : distance between the pin's two supports (simple) -> bending check.
+                            None -> bending check skipped (unless support="cantilever" with arm_mm).
+        Shear is always checked.
+        """
+        sig, tau = sy_MPa/safety_factor, 0.577*sy_MPa/safety_factor
+        res = {"shear": np.sqrt(4*force_N/(np.pi*shear_planes*tau))}
+        M = None
+        if support == "simple" and span_mm is not None:
+            lb = 0.0 if bearing_length_mm is None else bearing_length_mm   # lb=0 -> point load, conservative
+            M = force_N/4*(span_mm - lb/2)
+        elif support == "cantilever" and arm_mm is not None:
+            M = force_N*arm_mm
+        if M is not None:
+            res["bending"] = (32*M/(np.pi*sig))**(1/3)
+        if bearing_length_mm is not None:
+            allow = sig if bearing_allow_MPa is None else bearing_allow_MPa
+            res["bearing"] = force_N/(bearing_length_mm*allow)
+        gov = max(res, key=res.get)
+        return dict(d_min=res[gov], governed_by=gov, checks=res, M_Nmm=M,
+                    skipped=[k for k in ("bending", "bearing") if k not in res])
+
+    def check_pins(self, F, sy_MPa, safety_factor=2.0, edge_margin_mm=1.0, **kw):
+        """Compare the pins you chose with the loads: strength and fit, for both pins."""
+        r = self.max_pin_forces(F)
+        mg = self.pin_margins()
+        out = {}
+        for name, load in (("drive", r["max_slot_N"]), ("pivot", r["max_pivot_N"])):
+            m = self.min_pin_diameter(load, sy_MPa, safety_factor, **kw)
+            out[name] = dict(load_N=load, d_min=m["d_min"], governed_by=m["governed_by"],
+                             d_chosen=self.pin_diameter, strength_ok=self.pin_diameter >= m["d_min"],
+                             margins_mm=mg[name], fit_ok=min(mg[name].values()) >= edge_margin_mm,
+                             d_max_by_width=self.max_pin_for_width(name, edge_margin_mm))
+        return out
+
     
     # ----- blade outline and gap -----
-    
+
     def polygon(self, pose):
         local = np.array([[0, 0], [self.bl, -self.W], [self.Lb, -self.W], [self.Lb, 0]])
         return np.array([pose["T"] - b*pose["u"] + s*pose["n"] for b, s in local])
